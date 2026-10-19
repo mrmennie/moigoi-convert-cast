@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Moi Goi Convert · Chromecast</title>
+  <style>
+    :root { color-scheme: dark; font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b0810; color: #f3ead8; }
+    main { width: min(560px, calc(100vw - 40px)); padding: 26px; border: 1px solid #7653a6; border-radius: 16px; background: #171020; box-shadow: 0 18px 60px #0009; }
+    header { display: flex; align-items: center; gap: 14px; }
+    h1 { margin: 0; font-size: 22px; font-family: Georgia, serif; }
+    google-cast-launcher { width: 34px; height: 34px; margin-left: auto; --disconnected-color: #d3c0ed; --connected-color: #66b8ff; }
+    #title { color: #d3c0ed; margin: 20px 0 6px; overflow-wrap: anywhere; }
+    #status { color: #afa6b8; min-height: 22px; }
+    .controls { display: grid; grid-template-columns: auto 1fr auto; gap: 12px; align-items: center; margin-top: 18px; }
+    button { border: 1px solid #7653a6; border-radius: 9px; padding: 8px 12px; background: #271a37; color: #f3ead8; }
+    input[type=range] { width: 100%; accent-color: #66b8ff; }
+    .note { margin-top: 18px; font-size: 12px; color: #817789; }
+  </style>
+  <script>
+    let session = null;
+    let remotePlayer = null;
+    let remoteController = null;
+    let mediaLoaded = false;
+    let applyingConvertState = false;
+
+    function decodeLaunchRequest() {
+      const encoded = new URLSearchParams(window.location.hash.slice(1)).get('session');
+      if (!encoded) throw new Error('Open Chromecast from Convert so the protected local session is included.');
+      const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - encoded.length % 4) % 4);
+      return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(base64), c => c.charCodeAt(0))));
+    }
+
+    function status(message) { document.getElementById('status').textContent = message; }
+    async function reportState(event, detail = {}) {
+      if (!session) return;
+      try {
+        await fetch(session.controlURL, {
+          method: 'POST', mode: 'cors', cache: 'no-store', targetAddressSpace: 'local',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({event, ...detail})
+        });
+      } catch (_) { status('Chromecast is active; Convert state reporting is waiting for local-network access.'); }
+    }
+
+    async function synchronizeFromConvert() {
+      if (!session || !mediaLoaded || !remotePlayer || applyingConvertState) return;
+      try {
+        const response = await fetch(session.controlURL, {
+          method: 'GET', mode: 'cors', cache: 'no-store', targetAddressSpace: 'local'
+        });
+        if (!response.ok) return;
+        const state = await response.json();
+        applyingConvertState = true;
+        const projected = state.positionSeconds + (state.isPlaying ? Math.max(0, Date.now() - state.sampledAtMilliseconds) / 1000 : 0);
+        if (Math.abs((remotePlayer.currentTime || 0) - projected) > 1.25) {
+          remotePlayer.currentTime = Math.min(state.durationSeconds || projected, projected);
+          remoteController.seek();
+        }
+        if (state.isPlaying === remotePlayer.isPaused) remoteController.playOrPause();
+        if (remotePlayer.isMuted !== state.muted) { remotePlayer.isMuted = state.muted; remoteController.muteOrUnmute(); }
+        if (Math.abs((remotePlayer.volumeLevel || 0) - state.volume) > 0.02) {
+          remotePlayer.volumeLevel = state.volume; remoteController.setVolumeLevel();
+        }
+      } catch (_) {
+        status('Casting continues; waiting for Convert on this Mac.');
+      } finally {
+        applyingConvertState = false;
+      }
+    }
+
+    async function loadMedia() {
+      const castSession = cast.framework.CastContext.getInstance().getCurrentSession();
+      if (!castSession || mediaLoaded) return;
+      const mediaInfo = new chrome.cast.media.MediaInfo(session.mediaURL, session.contentType);
+      mediaInfo.metadata = new chrome.cast.media.GenericMediaMetadata();
+      mediaInfo.metadata.title = session.title;
+      const request = new chrome.cast.media.LoadRequest(mediaInfo);
+      request.currentTime = session.positionSeconds;
+      request.autoplay = session.autoplay;
+      try {
+        await castSession.loadMedia(request);
+        mediaLoaded = true;
+        status('Casting ' + session.title);
+        await reportState('loaded', {positionSeconds: remotePlayer.currentTime, paused: remotePlayer.isPaused});
+      } catch (error) {
+        status('Chromecast could not load this track: ' + String(error));
+        await reportState('failed', {message: String(error)});
+      }
+    }
+
+    function bindRemoteControls() {
+      remotePlayer = new cast.framework.RemotePlayer();
+      remoteController = new cast.framework.RemotePlayerController(remotePlayer);
+      remoteController.addEventListener(cast.framework.RemotePlayerEventType.ANY_CHANGE, () => {
+        document.getElementById('seek').value = remotePlayer.duration > 0 ? remotePlayer.currentTime / remotePlayer.duration : 0;
+        document.getElementById('time').textContent = Math.max(0, Math.round(remotePlayer.currentTime || 0)) + 's';
+      });
+      document.getElementById('play').addEventListener('click', () => { remoteController.playOrPause(); reportState('transport', {paused: remotePlayer.isPaused}); });
+      document.getElementById('stop').addEventListener('click', () => { remoteController.stop(); reportState('stopped'); });
+      document.getElementById('seek').addEventListener('change', event => {
+        remotePlayer.currentTime = (remotePlayer.duration || 0) * Number(event.target.value);
+        remoteController.seek(); reportState('seek', {positionSeconds: remotePlayer.currentTime});
+      });
+      window.setInterval(synchronizeFromConvert, 500);
+    }
+
+    window.__onGCastApiAvailable = function(isAvailable) {
+      if (!isAvailable) { status('Google Cast is not available in this browser. Open this page in Chrome.'); return; }
+      cast.framework.CastContext.getInstance().setOptions({
+        receiverApplicationId: chrome.cast.media.DEFAULT_MEDIA_RECEIVER_APP_ID,
+        autoJoinPolicy: chrome.cast.AutoJoinPolicy.ORIGIN_SCOPED
+      });
+      bindRemoteControls();
+      cast.framework.CastContext.getInstance().addEventListener(
+        cast.framework.CastContextEventType.SESSION_STATE_CHANGED,
+        event => {
+          if (event.sessionState === cast.framework.SessionState.SESSION_STARTED ||
+              event.sessionState === cast.framework.SessionState.SESSION_RESUMED) loadMedia();
+          if (event.sessionState === cast.framework.SessionState.SESSION_ENDED) { mediaLoaded = false; status('Cast session ended.'); reportState('ended'); }
+        });
+      status('Choose your Chromecast with the Cast button.');
+    };
+
+    window.addEventListener('DOMContentLoaded', () => {
+      try { session = decodeLaunchRequest(); document.getElementById('title').textContent = session.title; }
+      catch (error) { status(error.message); }
+    });
+  </script>
+  <script src="https://www.gstatic.com/cv/js/sender/v1/cast_sender.js?loadCastFramework=1"></script>
+</head>
+<body>
+  <main>
+    <header><h1>Moi Goi Convert</h1><google-cast-launcher aria-label="Choose Chromecast"></google-cast-launcher></header>
+    <div id="title">Chromecast handoff</div>
+    <div id="status">Preparing the official Google Cast sender…</div>
+    <div class="controls"><button id="play">Play / Pause</button><input id="seek" type="range" min="0" max="1" step="0.001" value="0"><span id="time">0s</span></div>
+    <button id="stop">Stop casting</button>
+    <div class="note">The media remains on your Mac and is offered only to the selected receiver through a temporary token-bound local address.</div>
+  </main>
+</body>
+</html>
