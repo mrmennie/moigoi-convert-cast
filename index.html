@@ -25,11 +25,32 @@
     let mediaLoaded = false;
     let applyingConvertState = false;
 
+    function validateLaunchRequest(request) {
+      const media = new URL(request.mediaURL);
+      const control = new URL(request.controlURL);
+      const supported = new Set(['video/mp4', 'video/x-m4v', 'video/webm', 'audio/mpeg', 'audio/mp4', 'audio/aac', 'audio/wav', 'audio/flac']);
+      const privateIPv4 = host => {
+        const octets = host.split('.').map(Number);
+        return octets.length === 4 && octets.every(value => Number.isInteger(value) && value >= 0 && value <= 255) &&
+          (octets[0] === 10 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+           (octets[0] === 192 && octets[1] === 168) || (octets[0] === 169 && octets[1] === 254));
+      };
+      const controlMatch = control.pathname.match(/^\/session\/([a-f0-9]{64})$/);
+      if (media.protocol !== 'http:' || !privateIPv4(media.hostname) || !media.port || media.username || media.password || media.search || media.hash ||
+          control.protocol !== 'http:' || control.hostname !== '127.0.0.1' || !control.port || control.username || control.password || control.search || control.hash ||
+          media.port !== control.port || !controlMatch || !media.pathname.startsWith('/media/' + controlMatch[1] + '/') ||
+          !supported.has(request.contentType) || typeof request.title !== 'string' || request.title.length > 512 ||
+          !Number.isFinite(request.positionSeconds) || request.positionSeconds < 0 || typeof request.autoplay !== 'boolean') {
+        throw new Error('This Chromecast link is not a valid Convert local session.');
+      }
+      return request;
+    }
+
     function decodeLaunchRequest() {
       const encoded = new URLSearchParams(window.location.hash.slice(1)).get('session');
       if (!encoded) throw new Error('Open Chromecast from Convert so the protected local session is included.');
       const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - encoded.length % 4) % 4);
-      return JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(base64), c => c.charCodeAt(0))));
+      return validateLaunchRequest(JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(base64), c => c.charCodeAt(0)))));
     }
 
     function status(message) { document.getElementById('status').textContent = message; }
